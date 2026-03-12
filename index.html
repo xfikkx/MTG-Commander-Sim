@@ -448,13 +448,101 @@ var ROCK_MAP = {
   "heraldic banner":{cmc:3,bonus:1},"prismatic lens":{cmc:2,bonus:1},"star compass":{cmc:2,bonus:1}
 };
 
+// ─── MANA COST PARSER ────────────────────────────────────────────────────────
+// Computes the minimum generic mana needed to cast a spell from its mana_cost string.
+// Scryfall mana_cost examples: "{3}{U}{B}", "{W/U}{W/U}", "{2/W}{2/W}", "{X}{R}", "{G}{G}"
+// Rules applied:
+//   • Numeric pips  {N}   → N generic mana
+//   • Colored pips  {W/U} hybrid → 1 mana (choose cheapest color)
+//   • Phyrexian     {W/P} → 0 (can pay 2 life instead; we treat as free for sim)
+//   • 2-generic hybrid {2/W} → 1 (always pay the color, cheaper than 2)
+//   • Snow          {S}   → 1
+//   • {X}           → 0  (variable; treated as 0 for minimum cast)
+//   • {C}           → 1 colorless
+//   • {T}, {Q}      → 0 (not mana)
+function parseManaString(manaStr) {
+  if (!manaStr) return null; // null = unknown
+  var pips = manaStr.match(/\{[^}]+\}/g) || [];
+  var total = 0;
+  for (var i = 0; i < pips.length; i++) {
+    var inner = pips[i].slice(1, -1).toUpperCase();
+    if (/^\d+$/.test(inner)) {
+      total += parseInt(inner, 10);       // {3} → 3
+    } else if (inner === 'X') {
+      total += 0;                         // {X} → 0 minimum
+    } else if (inner === 'C') {
+      total += 1;                         // {C} colorless
+    } else if (inner === 'S') {
+      total += 1;                         // {S} snow
+    } else if (inner === 'T' || inner === 'Q' || inner === 'E') {
+      total += 0;                         // tap/untap/energy — not mana
+    } else if (/^[2-9]\/[WUBRG]$/.test(inner)) {
+      total += 1;                         // {2/W} 2-hybrid → pay 1 colored
+    } else if (/^[WUBRG]\/P$/.test(inner)) {
+      total += 0;                         // {W/P} Phyrexian → pay life
+    } else if (/^[WUBRG]\/[WUBRG]$/.test(inner)) {
+      total += 1;                         // {W/U} hybrid → 1 mana either color
+    } else if (/^[WUBRGC]$/.test(inner)) {
+      total += 1;                         // single colored pip
+    }
+    // Anything unrecognized → 0 (safe fallback)
+  }
+  return total;
+}
+
+// Detect special casting keywords that affect when/how a card can be played.
+// Returns a flags object used by the sim's casting logic.
+function parseSpecialCasting(oracle, type_line) {
+  var o = (oracle || '').toLowerCase();
+  var tl = (type_line || '').toLowerCase();
+  return {
+    // Kicker: card can be cast without kicker; track minimum base cost only
+    hasKicker:    /\bkicker\b/.test(o),
+    // Flashback: can cast from graveyard — sim ignores (no GY tracking)
+    hasFlashback: /\bflashback\b/.test(o),
+    // Morph / Manifest: can be cast face-down for {3}; we use actual CMC
+    hasMorph:     /\bmorph\b|\bmanifest\b/.test(o),
+    // Foretell: can exile for {2} then cast cheaper; sim uses printed cost
+    hasForetell:  /\bforetell\b/.test(o),
+    // Suspend: cast for free after suspend counters — sim uses printed cost
+    hasSuspend:   /\bsuspend\b/.test(o),
+    // Escape / Aftermath / Jump-start: alternate cast from GY — sim ignores
+    hasEscape:    /\bescape\b|\baftermath\b|\bjump-start\b/.test(o),
+    // Adventure: instant/sorcery stapled to creature — both sides use printed costs
+    hasAdventure: /\badventure\b/.test(o),
+    // Emerge: can sacrifice a creature to reduce cost; sim applies -CMC reduction capped at printed
+    hasEmerge:    /\bemerge\b/.test(o),
+    // Delve: exile cards to pay generic mana; sim treats as moderate reduction
+    hasDelve:     /\bdelve\b/.test(o),
+    // Convoke: tap creatures to pay; sim gives 1 mana reduction per creature on board, capped
+    hasConvoke:   /\bconvoke\b/.test(o),
+    // Improvise: tap artifacts; sim gives 1 reduction per rock on board
+    hasImprovise: /\bimprovise\b/.test(o),
+    // Affinity: costs less per artifact; sim gives 1 reduction per rock
+    hasAffinity:  /\baffinity for artifacts\b/.test(o),
+    // Overload: replaces all targets; sim uses printed cost (no overload)
+    hasOverload:  /\boverload\b/.test(o),
+    // Evoke: cheaper cast that sacs itself; sim uses printed CMC (full value)
+    hasEvoke:     /\bevoke\b/.test(o),
+    // Ninjutsu: alternate play from hand; sim uses printed cost
+    hasNinjutsu:  /\bninjutsu\b/.test(o),
+    // Sneak Attack / Through the Breach style: sim does NOT model these (they're not the card's own ability)
+    // Bestow: enchantment aura mode costs more; sim uses printed CMC (creature mode)
+    hasBestow:    /\bbestow\b/.test(o),
+    // Mutate: sim uses printed cost
+    hasMutate:    /\bmutate\b/.test(o),
+    // Ward: doesn't affect casting cost
+    // Vanishing/Fading: doesn't affect casting
+    // Is this card X-spell? Cost includes {X}
+    hasX: /\{x\}/.test((oracle||'').toLowerCase())
+  };
+}
+
 // Parse token count from Scryfall oracle text
-// Catches: "create a", "create two 2/2", "create X", "create three 1/1" etc.
 function parseTokensFromOracle(oracle) {
   if (!oracle) return 0;
   var numWords = {a:1,an:1,one:1,two:2,three:3,four:4,five:5,six:6,seven:7,eight:8,nine:9,ten:10,thirteen:13};
   var best = 0;
-  // Match "create <qty> ... token" patterns
   var re = /create\s+([a-z]+|\d+|x)\s[^.!?]*?tokens?/gi;
   var m;
   while ((m = re.exec(oracle)) !== null) {
@@ -466,51 +554,43 @@ function parseTokensFromOracle(oracle) {
   return best;
 }
 
-// Map Scryfall type_line → simulation card type
-// Key fix: "Legendary Planeswalker — Vraska" is a planeswalker;
-// "Legendary Creature — Human Pirate" is a creature even if named Vraska.
+// Map Scryfall type_line → sim card type
+// Reads left-to-right priority: land > planeswalker > creature > artifact > enchantment > instant > sorcery
+// This correctly handles "Artifact Creature", "Enchantment Creature", "Legendary Planeswalker", etc.
 function scryfallTypeLine(type_line) {
   if (!type_line) return 'creature';
   var t = type_line.toLowerCase();
   if (t.includes('land'))         return 'land';
   if (t.includes('planeswalker')) return 'planeswalker';
+  if (t.includes('creature'))     return 'creature';   // before artifact/enchantment
   if (t.includes('artifact'))     return 'artifact';
   if (t.includes('enchantment'))  return 'enchantment';
   if (t.includes('instant'))      return 'instant';
   if (t.includes('sorcery'))      return 'sorcery';
-  if (t.includes('creature'))     return 'creature';
   return 'creature';
 }
 
-// Check if a card is a mana rock given its name + type
+// Detect mana rocks
 function detectManaRock(name, type_line, oracle) {
   var n = name.toLowerCase();
-  // Explicit ROCK_MAP entries
   var keys = Object.keys(ROCK_MAP);
   for (var ri = 0; ri < keys.length; ri++) {
     if (n.indexOf(keys[ri]) !== -1) return {yes:true, bonus:ROCK_MAP[keys[ri]].bonus, cmc:ROCK_MAP[keys[ri]].cmc};
   }
-  // Pattern-based artifact mana rocks
-  if ((type_line||'').toLowerCase().includes('artifact') &&
+  var tl = (type_line||'').toLowerCase();
+  if (tl.includes('artifact') && !tl.includes('creature') &&
       (n.indexOf('signet')!==-1||n.indexOf('talisman')!==-1||n.indexOf('locket')!==-1||
        n.indexOf('keyrune')!==-1||n.indexOf('cluestone')!==-1||n.indexOf('obelisk')!==-1||
        n.indexOf('medallion')!==-1||n.indexOf('banner')!==-1)) {
     return {yes:true, bonus:1, cmc:2};
   }
-  // Oracle-based: "add {" suggests mana production
-  if ((type_line||'').toLowerCase().includes('artifact') && oracle && /\badd \{/.test(oracle)) {
+  if (tl.includes('artifact') && !tl.includes('creature') && oracle && /\badd \{/.test(oracle)) {
     return {yes:true, bonus:1, cmc:2};
   }
   return {yes:false};
 }
 
-// Parse mana cost reduction from oracle text.
-// Returns {reducesAll, reducesCommander, reducesType, amount, manaProducer, manaAmount}
-// reducesAll: reduces all spells you cast
-// reducesCommander: specifically reduces commander spells
-// reducesType: reduces spells of a creature type (e.g. "Elf spells cost {1} less")
-// manaProducer: this creature taps for mana (like Llanowar Elves)
-// manaAmount: how much extra mana it produces per turn when on board
+// Parse cost-reduction and creature mana production from oracle text
 function parseCardAbilities(oracle, type_line, subtypes) {
   var o = (oracle || '').toLowerCase();
   var result = {
@@ -519,57 +599,47 @@ function parseCardAbilities(oracle, type_line, subtypes) {
     manaProducer: false, manaAmount: 0
   };
 
-  // Commander cost reduction — e.g. "your commander spells cost {2} less"
-  if (/commander spells?.{0,20}cost.{0,10}less/.test(o) ||
-      /cost.{0,10}less.{0,20}cast.{0,20}commander/.test(o)) {
+  // Commander cost reduction
+  if (/commander spells?.{0,25}cost.{0,10}less/.test(o) ||
+      /cost.{0,10}less.{0,25}cast.{0,25}commander/.test(o)) {
     var cm = o.match(/\{(\d+)\}\s*less/);
     result.reducesCommander = true;
     result.reductionAmount = cm ? parseInt(cm[1]) : 1;
   }
-
-  // Generic "spells you cast cost {N} less" (not type-specific)
-  if (!result.reducesCommander &&
-      /spells you cast cost \{(\d+)\} less/.test(o)) {
+  // Generic spell reduction
+  if (!result.reducesCommander && /spells you cast cost \{(\d+)\} less/.test(o)) {
     var gm = o.match(/spells you cast cost \{(\d+)\} less/);
     result.reducesAll = true;
     result.reductionAmount = gm ? parseInt(gm[1]) : 1;
   }
-
-  // Creature-type cost reduction — e.g. "Wizard spells you cast cost {1} less"
-  // or "Elf spells cost {1} less to cast"
-  var typeReduceMatch = o.match(/([a-z]+)\s+spells?\s+(?:you cast\s+)?cost\s+\{(\d+)\}\s+less/);
-  if (typeReduceMatch) {
-    var reducedType = typeReduceMatch[1];
-    // Make sure it's a creature type word, not a keyword like "instant" or "sorcery"
-    var nonTypes = ['instant','sorcery','artifact','enchantment','creature','land','permanent'];
-    if (nonTypes.indexOf(reducedType) === -1) {
-      result.reducesType = reducedType.charAt(0).toUpperCase() + reducedType.slice(1);
-      result.reductionAmount = parseInt(typeReduceMatch[2]) || 1;
-      result.reducesAll = false; // override generic if type-specific
+  // Creature-type cost reduction
+  var typeMatch = o.match(/([a-z]+)\s+spells?\s+(?:you cast\s+)?cost\s+\{(\d+)\}\s+less/);
+  if (typeMatch) {
+    var nonTypes = ['instant','sorcery','artifact','enchantment','creature','land','permanent','spell'];
+    if (nonTypes.indexOf(typeMatch[1]) === -1) {
+      result.reducesType = typeMatch[1].charAt(0).toUpperCase() + typeMatch[1].slice(1);
+      result.reductionAmount = parseInt(typeMatch[2]) || 1;
+      result.reducesAll = false;
     }
   }
 
-  // Creature mana production — tap for mana
-  // Patterns: "{T}: Add {G}", "{T}: Add {G} or {U}", "{T}: Add one mana", creatures that add mana
+  // Creature tap-for-mana abilities
   if (/\{t\}:\s*add\s*\{/.test(o)) {
-    // Count number of mana symbols in the add clause
     var addMatch = o.match(/\{t\}:\s*add\s*(\{[^}]+\}(?:\s*(?:or|and)\s*\{[^}]+\})*)/);
     if (addMatch) {
-      var symbols = addMatch[1].match(/\{[^}]+\}/g) || [];
-      // Each symbol = 1 mana (ignore X, ignore multi-value like {2})
-      var manaVal = symbols.filter(function(s) {
-        var inner = s.slice(1,-1);
-        return inner.length <= 2 && !/^\d+$/.test(inner) && inner !== 'X' && inner !== 'T';
+      var syms = addMatch[1].match(/\{[^}]+\}/g) || [];
+      var mv = syms.filter(function(s){
+        var inn = s.slice(1,-1);
+        return !/^\d+$/.test(inn) && inn !== 'X' && inn !== 'T';
       }).length;
-      if (manaVal > 0) { result.manaProducer = true; result.manaAmount = manaVal; }
+      if (mv > 0) { result.manaProducer = true; result.manaAmount = mv; }
     }
-    if (!result.manaProducer && (type_line||'').toLowerCase().indexOf('creature') !== -1) {
+    if (!result.manaProducer && (type_line||'').toLowerCase().includes('creature')) {
       result.manaProducer = true; result.manaAmount = 1;
     }
   }
-  // "Add {G} for each" or "Add an amount of mana" style (Selvala, Priest of Titania etc.)
   if (/add \{[wubrgc]\} for each/.test(o) || /adds? mana equal/.test(o)) {
-    result.manaProducer = true; result.manaAmount = 2; // conservative estimate
+    result.manaProducer = true; result.manaAmount = Math.max(result.manaAmount, 2);
   }
 
   return result;
@@ -593,35 +663,44 @@ async function batchScryfallLookup(names, onProgress) {
       if (json && json.data) {
         json.data.forEach(function(card) {
           var key = card.name.toLowerCase();
-          // For double-faced cards (DFCs), get type_line and oracle from front face
-          var type_line = card.type_line || (card.card_faces ? card.card_faces[0].type_line : '');
-          var oracle = card.oracle_text || (card.card_faces ? card.card_faces.map(function(f){return f.oracle_text||'';}).join('\n') : '');
-          var cmc = card.cmc !== undefined ? Math.round(card.cmc) : 3;
-          var simType = scryfallTypeLine(type_line);
+          // For DFCs, use front face data
+          var type_line  = card.type_line  || (card.card_faces ? card.card_faces[0].type_line  : '');
+          var oracle     = card.oracle_text || (card.card_faces ? card.card_faces.map(function(f){return f.oracle_text||'';}).join('\n') : '');
+          var mana_cost  = card.mana_cost  || (card.card_faces ? card.card_faces[0].mana_cost  : '') || '';
 
-          // Extract creature subtypes (everything after "—" in type line if creature)
+          // ── CMC: parse from mana_cost string for accuracy ──
+          // Scryfall's card.cmc is authoritative for the total, but parseManaString
+          // lets us correctly handle hybrid ({W/U}=1), phyrexian ({W/P}=0), {X}=0 etc.
+          // We use parseManaString as primary and fall back to Scryfall's cmc field.
+          var parsedCmc = parseManaString(mana_cost);
+          var cmc = (parsedCmc !== null) ? parsedCmc
+                  : (card.cmc !== undefined ? Math.round(card.cmc) : 3);
+
+          // Subtypes (after "—")
           var subtypes = [];
           if (type_line && type_line.indexOf('\u2014') !== -1) {
             var afterDash = type_line.split('\u2014')[1] || '';
             subtypes = afterDash.trim().split(/\s+/).filter(Boolean);
           }
 
+          var simType    = scryfallTypeLine(type_line);
           var tokenCount = parseTokensFromOracle(oracle);
-          var rock = detectManaRock(card.name, type_line, oracle);
-          if (rock.yes && simType === 'artifact') {
-            if (rock.cmc !== undefined) cmc = rock.cmc;
-          }
+          var special    = parseSpecialCasting(oracle, type_line);
+          var rock       = detectManaRock(card.name, type_line, oracle);
+          var abilities  = parseCardAbilities(oracle, type_line, subtypes);
 
-          var abilities = parseCardAbilities(oracle, type_line, subtypes);
+          // For mana rocks, override CMC with known value if available
+          if (rock.yes && simType !== 'creature' && rock.cmc !== undefined) cmc = rock.cmc;
 
           results[key] = {
-            type: simType, cmc: cmc,
-            isManaRock: rock.yes && simType === 'artifact',
+            type: simType, cmc: cmc, mana_cost: mana_cost,
+            isManaRock: rock.yes && simType !== 'creature',
             rockBonus: rock.bonus || 1,
             tokenCount: tokenCount,
             color_identity: card.color_identity || [],
             subtypes: subtypes,
-            // Cost reduction fields
+            special: special,
+            // Cost reduction
             reducesAll: abilities.reducesAll,
             reducesCommander: abilities.reducesCommander,
             reducesType: abilities.reducesType,
@@ -632,10 +711,9 @@ async function batchScryfallLookup(names, onProgress) {
           };
         });
       }
-    } catch(e) { /* network error — handled by fallback */ }
+    } catch(e) { /* network error — fallback handles */ }
     done += chunks[ci].length;
     if (onProgress) onProgress(done, names.length);
-    // Respect Scryfall rate limit (~10 req/s)
     if (ci < chunks.length - 1) await new Promise(function(r){ setTimeout(r, 110); });
   }
   return results;
@@ -669,10 +747,11 @@ function resolveCard(name) {
   if (CARD_DB[key]) {
     var d = CARD_DB[key];
     return {
-      name: name, type: d.type, cmc: d.cmc,
+      name: name, type: d.type, cmc: d.cmc, mana_cost: d.mana_cost || '',
       isManaRock: d.isManaRock, rockBonus: d.rockBonus || 1,
       tokenCount: d.tokenCount || 0,
       subtypes: d.subtypes || [],
+      special: d.special || {},
       reducesAll: d.reducesAll || false,
       reducesCommander: d.reducesCommander || false,
       reducesType: d.reducesType || null,
@@ -681,7 +760,7 @@ function resolveCard(name) {
       manaAmount: d.manaAmount || 0
     };
   }
-  return Object.assign({name: name}, inferCardFallback(name));
+  return Object.assign({name: name, mana_cost: '', special: {}}, inferCardFallback(name));
 }
 
 var PARSED_DECK = [];
@@ -955,59 +1034,102 @@ function simulateGame() {
     return mult;
   }
 
-  // Calculate total mana available this turn (lands + rocks + creature mana producers on board)
+  // Calculate total mana available this turn (lands + rocks + creature producers)
   function getTotalMana(landCount) {
-    var rockMana = board.filter(function(c){ return c.type==='artifact' && c.isManaRock; })
+    var rockMana = board.filter(function(c){ return c.isManaRock && c.type !== 'creature'; })
                         .reduce(function(s,r){ return s+(r.rockBonus||1); }, 0);
     var creatureMana = board.filter(function(c){ return c.type==='creature' && c.manaProducer; })
                             .reduce(function(s,c){ return s+(c.manaAmount||1); }, 0);
     return landCount + rockMana + creatureMana;
   }
 
-  // Calculate how much a card actually costs given board state reducers
+  // Compute the effective casting cost of a card given current board state.
+  // Applies: cost reducers, Convoke, Improvise, Affinity, Delve, Emerge in a reasonable sim model.
+  // Returns the mana you need to spend from your pool.
   function getEffectiveCost(card) {
     var base = card.cmc || 0;
-    var reduction = 0;
+    var sp = card.special || {};
+
+    // ── Alternative / Alternate casting costs ──
+    // Kicker: minimum cast is the base (non-kicker) cost. Scryfall cmc includes no kicker,
+    // so card.cmc is already the base — no change needed.
+
+    // Morph: can be cast face-down for {3} if that's cheaper
+    if (sp.hasMorph && base > 3) base = Math.min(base, 3);
+
+    // Emerge: sacrifice a creature to reduce cost by its CMC.
+    // Conservative sim: assume the cheapest creature on board can be sacrificed.
+    if (sp.hasEmerge) {
+      var boardCreatures = board.filter(function(c){ return c.type==='creature' && !c.isCommander; });
+      if (boardCreatures.length > 0) {
+        var minCmc = Math.min.apply(null, boardCreatures.map(function(c){ return c.cmc||0; }));
+        base = Math.max(0, base - minCmc);
+      }
+    }
+
+    // Delve: exile cards from graveyard to pay generic mana.
+    // Sim model: each card in simulated GY can pay 1 generic. Cap at base-1 (must pay ≥1).
+    if (sp.hasDelve) {
+      var gySize = gy.length;
+      base = Math.max(1, base - Math.min(gySize, base - 1));
+    }
+
+    // Convoke: tap creatures to pay. Each untapped creature on board pays 1 mana.
+    // Sim model: can use up to all creatures (they don't attack in sim), cap reduction at base-1.
+    if (sp.hasConvoke) {
+      var creaturesForConvoke = board.filter(function(c){ return c.type==='creature' && !c.isCommander; }).length;
+      base = Math.max(0, base - Math.min(creaturesForConvoke, base));
+    }
+
+    // Improvise: tap artifacts to pay generic. Each mana rock on board contributes.
+    if (sp.hasImprovise) {
+      var artifactsForImprovise = board.filter(function(c){ return c.type==='artifact'; }).length;
+      base = Math.max(0, base - Math.min(artifactsForImprovise, base));
+    }
+
+    // Affinity for artifacts: costs 1 less per artifact on board.
+    if (sp.hasAffinity) {
+      var artifactCt = board.filter(function(c){ return c.type==='artifact'; }).length;
+      base = Math.max(0, base - artifactCt);
+    }
+
+    // ── Static cost reducers on board ──
     for (var bi = 0; bi < board.length; bi++) {
       var b = board[bi];
       if (!b.reductionAmount) continue;
       if (b.reducesAll) {
-        reduction += b.reductionAmount;
+        base = Math.max(0, base - b.reductionAmount);
       } else if (b.reducesType && card.subtypes && card.subtypes.length > 0) {
-        // Check if this card shares the creature type being reduced
-        for (var si = 0; si < card.subtypes.length; si++) {
-          if (card.subtypes[si].toLowerCase() === b.reducesType.toLowerCase()) {
-            reduction += b.reductionAmount;
+        for (var si2 = 0; si2 < card.subtypes.length; si2++) {
+          if (card.subtypes[si2].toLowerCase() === b.reducesType.toLowerCase()) {
+            base = Math.max(0, base - b.reductionAmount);
             break;
           }
         }
       }
     }
-    return Math.max(0, base - reduction);
+
+    return Math.max(0, base);
   }
 
-  // Calculate effective commander cost, accounting for reducers on board
+  // Commander cost with reducers
   function getCommanderCost() {
     var base = cmdCmc + (cmdCasts * 2);
-    var reduction = 0;
     for (var bi = 0; bi < board.length; bi++) {
       var b = board[bi];
       if (!b.reductionAmount) continue;
-      if (b.reducesCommander) {
-        reduction += b.reductionAmount;
-      } else if (b.reducesAll) {
-        reduction += b.reductionAmount;
+      if (b.reducesCommander || b.reducesAll) {
+        base = Math.max(0, base - b.reductionAmount);
       } else if (b.reducesType && COMMANDER.subtypes && COMMANDER.subtypes.length > 0) {
-        // Check if commander shares the creature type
-        for (var si = 0; si < COMMANDER.subtypes.length; si++) {
-          if (COMMANDER.subtypes[si].toLowerCase() === b.reducesType.toLowerCase()) {
-            reduction += b.reductionAmount;
+        for (var si2 = 0; si2 < COMMANDER.subtypes.length; si2++) {
+          if (COMMANDER.subtypes[si2].toLowerCase() === b.reducesType.toLowerCase()) {
+            base = Math.max(0, base - b.reductionAmount);
             break;
           }
         }
       }
     }
-    return Math.max(0, base - reduction);
+    return Math.max(0, base);
   }
 
   for (var turn = 1; turn <= 10; turn++) {
@@ -1064,12 +1186,31 @@ function simulateGame() {
       handArr = handArr.filter(function(c) { return c.uid !== sp.uid; });
       if (["creature","artifact","enchantment","planeswalker"].indexOf(sp.type) !== -1) {
         board.push(sp);
-        // Build cast label — show type detail including subtypes for creatures
-        var castLabel = sp.name + " (" + sp.type;
+        // Build cast label
+        var castLabel = sp.name + " (";
         if (sp.type === 'creature' && sp.subtypes && sp.subtypes.length > 0) {
-          castLabel += " \u2014 " + sp.subtypes.slice(0,3).join(' ');
+          castLabel += sp.type + " \u2014 " + sp.subtypes.slice(0,3).join(' ');
+        } else {
+          castLabel += sp.type;
         }
-        if (effectiveCost < (sp.cmc || 0)) castLabel += " [cost " + effectiveCost + "]";
+        // Show mana cost if available
+        if (sp.mana_cost) castLabel += " \u00b7 " + sp.mana_cost;
+        // Show effective cost if reduced
+        if (effectiveCost < (sp.cmc || 0)) castLabel += " \u2192 cost " + effectiveCost;
+        // Show special mechanics
+        var flags = [];
+        var spc = sp.special || {};
+        if (spc.hasKicker)    flags.push("kicker");
+        if (spc.hasConvoke)   flags.push("convoke");
+        if (spc.hasImprovise) flags.push("improvise");
+        if (spc.hasDelve)     flags.push("delve");
+        if (spc.hasEmerge)    flags.push("emerge");
+        if (spc.hasAffinity)  flags.push("affinity");
+        if (spc.hasMorph)     flags.push("morph");
+        if (spc.hasForetell)  flags.push("foretell");
+        if (spc.hasMutate)    flags.push("mutate");
+        if (spc.hasBestow)    flags.push("bestow");
+        if (flags.length) castLabel += " \u00b7 " + flags.join(", ");
         castLabel += ")";
         actions.push({type:"cast", text:"Cast: " + castLabel});
 
@@ -1350,7 +1491,9 @@ function renderRunDetail(idx) {
       var card = sorted[hi];
       var tc = typeColors[card.type] || "#94a3b8";
       var tb = typeBorders[card.type] || "rgba(255,255,255,0.1)";
-      var cmcStr = card.type === 'land' ? 'Land' : 'CMC ' + (card.cmc !== undefined ? card.cmc : '?');
+      var cmcStr = card.type === 'land' ? 'Land'
+                 : card.mana_cost ? card.mana_cost
+                 : 'CMC ' + (card.cmc !== undefined ? card.cmc : '?');
       h += '<div class="hand-card" style="border:1px solid ' + tb + '">';
       h += '<div class="hand-card-name" title="' + card.name + '">' + card.name + '</div>';
       h += '<div class="hand-card-type" style="color:' + tc + '">' + (card.type || 'unknown') + '</div>';
