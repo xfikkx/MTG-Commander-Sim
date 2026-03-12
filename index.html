@@ -504,6 +504,77 @@ function detectManaRock(name, type_line, oracle) {
   return {yes:false};
 }
 
+// Parse mana cost reduction from oracle text.
+// Returns {reducesAll, reducesCommander, reducesType, amount, manaProducer, manaAmount}
+// reducesAll: reduces all spells you cast
+// reducesCommander: specifically reduces commander spells
+// reducesType: reduces spells of a creature type (e.g. "Elf spells cost {1} less")
+// manaProducer: this creature taps for mana (like Llanowar Elves)
+// manaAmount: how much extra mana it produces per turn when on board
+function parseCardAbilities(oracle, type_line, subtypes) {
+  var o = (oracle || '').toLowerCase();
+  var result = {
+    reducesAll: false, reducesCommander: false,
+    reducesType: null, reductionAmount: 0,
+    manaProducer: false, manaAmount: 0
+  };
+
+  // Commander cost reduction — e.g. "your commander spells cost {2} less"
+  if (/commander spells?.{0,20}cost.{0,10}less/.test(o) ||
+      /cost.{0,10}less.{0,20}cast.{0,20}commander/.test(o)) {
+    var cm = o.match(/\{(\d+)\}\s*less/);
+    result.reducesCommander = true;
+    result.reductionAmount = cm ? parseInt(cm[1]) : 1;
+  }
+
+  // Generic "spells you cast cost {N} less" (not type-specific)
+  if (!result.reducesCommander &&
+      /spells you cast cost \{(\d+)\} less/.test(o)) {
+    var gm = o.match(/spells you cast cost \{(\d+)\} less/);
+    result.reducesAll = true;
+    result.reductionAmount = gm ? parseInt(gm[1]) : 1;
+  }
+
+  // Creature-type cost reduction — e.g. "Wizard spells you cast cost {1} less"
+  // or "Elf spells cost {1} less to cast"
+  var typeReduceMatch = o.match(/([a-z]+)\s+spells?\s+(?:you cast\s+)?cost\s+\{(\d+)\}\s+less/);
+  if (typeReduceMatch) {
+    var reducedType = typeReduceMatch[1];
+    // Make sure it's a creature type word, not a keyword like "instant" or "sorcery"
+    var nonTypes = ['instant','sorcery','artifact','enchantment','creature','land','permanent'];
+    if (nonTypes.indexOf(reducedType) === -1) {
+      result.reducesType = reducedType.charAt(0).toUpperCase() + reducedType.slice(1);
+      result.reductionAmount = parseInt(typeReduceMatch[2]) || 1;
+      result.reducesAll = false; // override generic if type-specific
+    }
+  }
+
+  // Creature mana production — tap for mana
+  // Patterns: "{T}: Add {G}", "{T}: Add {G} or {U}", "{T}: Add one mana", creatures that add mana
+  if (/\{t\}:\s*add\s*\{/.test(o)) {
+    // Count number of mana symbols in the add clause
+    var addMatch = o.match(/\{t\}:\s*add\s*(\{[^}]+\}(?:\s*(?:or|and)\s*\{[^}]+\})*)/);
+    if (addMatch) {
+      var symbols = addMatch[1].match(/\{[^}]+\}/g) || [];
+      // Each symbol = 1 mana (ignore X, ignore multi-value like {2})
+      var manaVal = symbols.filter(function(s) {
+        var inner = s.slice(1,-1);
+        return inner.length <= 2 && !/^\d+$/.test(inner) && inner !== 'X' && inner !== 'T';
+      }).length;
+      if (manaVal > 0) { result.manaProducer = true; result.manaAmount = manaVal; }
+    }
+    if (!result.manaProducer && (type_line||'').toLowerCase().indexOf('creature') !== -1) {
+      result.manaProducer = true; result.manaAmount = 1;
+    }
+  }
+  // "Add {G} for each" or "Add an amount of mana" style (Selvala, Priest of Titania etc.)
+  if (/add \{[wubrgc]\} for each/.test(o) || /adds? mana equal/.test(o)) {
+    result.manaProducer = true; result.manaAmount = 2; // conservative estimate
+  }
+
+  return result;
+}
+
 // Batch-fetch up to 75 cards per request from Scryfall /cards/collection
 async function batchScryfallLookup(names, onProgress) {
   var results = {};
@@ -527,17 +598,37 @@ async function batchScryfallLookup(names, onProgress) {
           var oracle = card.oracle_text || (card.card_faces ? card.card_faces.map(function(f){return f.oracle_text||'';}).join('\n') : '');
           var cmc = card.cmc !== undefined ? Math.round(card.cmc) : 3;
           var simType = scryfallTypeLine(type_line);
+
+          // Extract creature subtypes (everything after "—" in type line if creature)
+          var subtypes = [];
+          if (type_line && type_line.indexOf('\u2014') !== -1) {
+            var afterDash = type_line.split('\u2014')[1] || '';
+            subtypes = afterDash.trim().split(/\s+/).filter(Boolean);
+          }
+
           var tokenCount = parseTokensFromOracle(oracle);
           var rock = detectManaRock(card.name, type_line, oracle);
           if (rock.yes && simType === 'artifact') {
             if (rock.cmc !== undefined) cmc = rock.cmc;
           }
+
+          var abilities = parseCardAbilities(oracle, type_line, subtypes);
+
           results[key] = {
             type: simType, cmc: cmc,
             isManaRock: rock.yes && simType === 'artifact',
             rockBonus: rock.bonus || 1,
             tokenCount: tokenCount,
-            color_identity: card.color_identity || []
+            color_identity: card.color_identity || [],
+            subtypes: subtypes,
+            // Cost reduction fields
+            reducesAll: abilities.reducesAll,
+            reducesCommander: abilities.reducesCommander,
+            reducesType: abilities.reducesType,
+            reductionAmount: abilities.reductionAmount,
+            // Creature mana production
+            manaProducer: abilities.manaProducer,
+            manaAmount: abilities.manaAmount
           };
         });
       }
@@ -577,9 +668,20 @@ function resolveCard(name) {
   var key = name.toLowerCase().trim();
   if (CARD_DB[key]) {
     var d = CARD_DB[key];
-    return { name:name, type:d.type, cmc:d.cmc, isManaRock:d.isManaRock, rockBonus:d.rockBonus||1, tokenCount:d.tokenCount||0 };
+    return {
+      name: name, type: d.type, cmc: d.cmc,
+      isManaRock: d.isManaRock, rockBonus: d.rockBonus || 1,
+      tokenCount: d.tokenCount || 0,
+      subtypes: d.subtypes || [],
+      reducesAll: d.reducesAll || false,
+      reducesCommander: d.reducesCommander || false,
+      reducesType: d.reducesType || null,
+      reductionAmount: d.reductionAmount || 0,
+      manaProducer: d.manaProducer || false,
+      manaAmount: d.manaAmount || 0
+    };
   }
-  return Object.assign({name:name}, inferCardFallback(name));
+  return Object.assign({name: name}, inferCardFallback(name));
 }
 
 var PARSED_DECK = [];
@@ -663,36 +765,38 @@ function parseDeck() {
     if (isNaN(cmcVal) || cmcVal < 0) cmcVal = 5;
     document.getElementById('cmdCmcInput').value = cmcVal;
     var colorIdentity = cmdData ? (cmdData.color_identity || []) : [];
+    var cmdSubtypes = cmdData ? (cmdData.subtypes || []) : [];
 
     if (cmdData) {
       document.getElementById('cmcHint').innerHTML = '<span style="color:#4ade80">&#10003; CMC <strong>' + cmcVal + '</strong> auto-detected &middot; ' + Object.keys(CARD_DB).length + ' cards verified via Scryfall</span>';
     } else {
       document.getElementById('cmcHint').innerHTML = '<span style="color:#fbbf24">&#9888; Commander not found on Scryfall &mdash; CMC set to ' + cmcVal + ' &middot; Adjust if needed</span>';
     }
-    finishLoadDeck(cards, cmdName, cmcVal, total, colorIdentity);
+    finishLoadDeck(cards, cmdName, cmcVal, total, colorIdentity, cmdSubtypes);
   }).catch(function() {
     sfProg.classList.remove('active');
     document.getElementById('parseBtn').disabled = false;
     var cmcFallback = parseInt(document.getElementById('cmdCmcInput').value, 10);
     if (isNaN(cmcFallback) || cmcFallback < 0) cmcFallback = 5;
     document.getElementById('cmcHint').innerHTML = '<span style="color:#f87171">&#9888; Scryfall unreachable &mdash; using local inference &middot; CMC set to ' + cmcFallback + '</span>';
-    finishLoadDeck(cards, cmdName, cmcFallback, total, []);
+    finishLoadDeck(cards, cmdName, cmcFallback, total, [], []);
   });
 }
 
-function finishLoadDeck(cards, cmdName, cmcVal, total, colorIdentity) {
+function finishLoadDeck(cards, cmdName, cmcVal, total, colorIdentity, cmdSubtypes) {
   var inp = document.getElementById('deckInput');
-  COMMANDER = { name:cmdName, type:'creature', cmc:cmcVal, isCommander:true };
+  COMMANDER = { name:cmdName, type:'creature', cmc:cmcVal, isCommander:true, subtypes: cmdSubtypes || [] };
   PARSED_DECK = [];
   for (var di = 1; di < cards.length; di++) PARSED_DECK.push(resolveCard(cards[di]));
   inp.classList.add('input-ok');
 
   var typeCounts = {};
   for (var pi = 0; pi < PARSED_DECK.length; pi++) { var t = PARSED_DECK[pi].type; typeCounts[t] = (typeCounts[t]||0)+1; }
-  displaySuccess(cmdName, cmcVal, total, typeCounts, colorIdentity);
+  displaySuccess(cmdName, cmcVal, total, typeCounts, colorIdentity, cmdSubtypes || []);
 
   document.getElementById('cmdNameText').textContent = cmdName;
-  document.getElementById('cmdSubText').textContent = 'CMC ' + cmcVal + ' \u00b7 +2 mana tax per recast';
+  var subtypeDisplay = (cmdSubtypes && cmdSubtypes.length) ? cmdSubtypes.join(' ') + ' \u00b7 ' : '';
+  document.getElementById('cmdSubText').textContent = subtypeDisplay + 'CMC ' + cmcVal + ' \u00b7 +2 mana tax per recast';
   document.getElementById('cmdDisplay').style.display = 'block';
   document.getElementById('mainTitle').textContent = cmdName;
   document.getElementById('mainSubtitle').textContent = 'Commander Deck \u00b7 99 Cards \u00b7 Monte Carlo Simulation';
@@ -719,12 +823,13 @@ function displayErrors(errs, total) {
   document.getElementById('simBtn').disabled = true;
 }
 
-function displaySuccess(cmdName, cmc, total, typeCounts, colorIdentity) {
+function displaySuccess(cmdName, cmc, total, typeCounts, colorIdentity, cmdSubtypes) {
   var vb = document.getElementById('validationBox');
   vb.className = 'show-ok';
   var ciStr = (colorIdentity && colorIdentity.length) ? '{' + colorIdentity.join('') + '}' : '{C}';
+  var subtypeStr = (cmdSubtypes && cmdSubtypes.length) ? ' \u2014 ' + cmdSubtypes.join(' ') : '';
   vb.innerHTML = '<div class="v-title v-ok">&#10003; VALID &mdash; ' + total + ' cards loaded &middot; Scryfall-verified</div>'
-    + '<div class="v-item v-ok">&rsaquo; Commander: ' + cmdName + ' &mdash; CMC ' + cmc + ' ' + ciStr + '</div>'
+    + '<div class="v-item v-ok">&rsaquo; Commander: ' + cmdName + subtypeStr + ' &mdash; CMC ' + cmc + ' ' + ciStr + '</div>'
     + '<div class="v-item v-dim">&rsaquo; 99-card library ready for simulation</div>';
   var order = ['creature','land','artifact','instant','sorcery','enchantment','planeswalker'];
   var colors = {creature:'#a78bfa',land:'#4ade80',artifact:'#94a3b8',instant:'#60a5fa',sorcery:'#c084fc',enchantment:'#86efac',planeswalker:'#f87171'};
@@ -850,47 +955,142 @@ function simulateGame() {
     return mult;
   }
 
+  // Calculate total mana available this turn (lands + rocks + creature mana producers on board)
+  function getTotalMana(landCount) {
+    var rockMana = board.filter(function(c){ return c.type==='artifact' && c.isManaRock; })
+                        .reduce(function(s,r){ return s+(r.rockBonus||1); }, 0);
+    var creatureMana = board.filter(function(c){ return c.type==='creature' && c.manaProducer; })
+                            .reduce(function(s,c){ return s+(c.manaAmount||1); }, 0);
+    return landCount + rockMana + creatureMana;
+  }
+
+  // Calculate how much a card actually costs given board state reducers
+  function getEffectiveCost(card) {
+    var base = card.cmc || 0;
+    var reduction = 0;
+    for (var bi = 0; bi < board.length; bi++) {
+      var b = board[bi];
+      if (!b.reductionAmount) continue;
+      if (b.reducesAll) {
+        reduction += b.reductionAmount;
+      } else if (b.reducesType && card.subtypes && card.subtypes.length > 0) {
+        // Check if this card shares the creature type being reduced
+        for (var si = 0; si < card.subtypes.length; si++) {
+          if (card.subtypes[si].toLowerCase() === b.reducesType.toLowerCase()) {
+            reduction += b.reductionAmount;
+            break;
+          }
+        }
+      }
+    }
+    return Math.max(0, base - reduction);
+  }
+
+  // Calculate effective commander cost, accounting for reducers on board
+  function getCommanderCost() {
+    var base = cmdCmc + (cmdCasts * 2);
+    var reduction = 0;
+    for (var bi = 0; bi < board.length; bi++) {
+      var b = board[bi];
+      if (!b.reductionAmount) continue;
+      if (b.reducesCommander) {
+        reduction += b.reductionAmount;
+      } else if (b.reducesAll) {
+        reduction += b.reductionAmount;
+      } else if (b.reducesType && COMMANDER.subtypes && COMMANDER.subtypes.length > 0) {
+        // Check if commander shares the creature type
+        for (var si = 0; si < COMMANDER.subtypes.length; si++) {
+          if (COMMANDER.subtypes[si].toLowerCase() === b.reducesType.toLowerCase()) {
+            reduction += b.reductionAmount;
+            break;
+          }
+        }
+      }
+    }
+    return Math.max(0, base - reduction);
+  }
+
   for (var turn = 1; turn <= 10; turn++) {
     var actions = [];
     var dr = libArr.shift();
     if (dr) { handArr.push(dr); actions.push({type:"draw", text:"Drew: " + dr.name}); }
+
     var landCt = board.filter(function(c) { return c.type === 'land'; }).length;
-    var rockMana = board.filter(function(c) { return c.type === 'artifact' && c.isManaRock; }).reduce(function(s, r) { return s + (r.rockBonus || 1); }, 0);
-    var mana = landCt + rockMana;
+    var mana = getTotalMana(landCt);
+
+    // Play a land
     var landIdx = -1;
     for (var k = 0; k < handArr.length; k++) { if (handArr[k].type === 'land') { landIdx = k; break; } }
     if (landIdx !== -1) {
       var ld = handArr.splice(landIdx, 1)[0];
-      board.push(ld); mana++;
+      board.push(ld); landCt++; mana++;
       actions.push({type:"land", text:"Played: " + ld.name});
     }
+
+    // Play mana rocks cheapest first
     var rocks = handArr.filter(function(c) { return c.type === 'artifact' && c.isManaRock && c.cmc <= mana; });
     rocks.sort(function(a, b) { return a.cmc - b.cmc; });
     for (var ri = 0; ri < rocks.length; ri++) {
       var rk = rocks[ri];
-      if (rk.cmc <= mana) { mana -= rk.cmc; mana += (rk.rockBonus || 1); handArr = handArr.filter(function(c) { return c.uid !== rk.uid; }); board.push(rk); actions.push({type:"cast", text:"Cast: " + rk.name + " (mana rock)"}); }
+      if (rk.cmc <= mana) {
+        mana -= rk.cmc; mana += (rk.rockBonus || 1);
+        handArr = handArr.filter(function(c) { return c.uid !== rk.uid; });
+        board.push(rk);
+        actions.push({type:"cast", text:"Cast: " + rk.name + " (mana rock)"});
+      }
     }
+
+    // Try to cast commander using effective cost
     if (!cmdOut) {
-      var cmdCost = cmdCmc + (cmdCasts * 2);
-      if (mana >= cmdCost) { mana -= cmdCost; cmdOut = true; cmdCasts++; cmdTurn = turn; board.push(Object.assign({}, COMMANDER, {uid:'cmd-' + cmdCasts})); actions.push({type:"cmd", text:"Cast COMMANDER: " + COMMANDER.name + " (cost " + cmdCost + ")"}); }
+      var cmdCost = getCommanderCost();
+      if (mana >= cmdCost) {
+        mana -= cmdCost; cmdOut = true; cmdCasts++; cmdTurn = turn;
+        var cmdCard = Object.assign({}, COMMANDER, {uid:'cmd-'+cmdCasts});
+        board.push(cmdCard);
+        var reductionNote = (cmdCost < cmdCmc + ((cmdCasts-1)*2)) ? ' [reduced from ' + (cmdCmc + ((cmdCasts-1)*2)) + ']' : '';
+        actions.push({type:"cmd", text:"Cast COMMANDER: " + COMMANDER.name + " (cost " + cmdCost + reductionNote + ")"});
+      }
     }
-    var castable = handArr.filter(function(c) { return c.type !== 'land' && !c.isManaRock && c.cmc <= mana; });
-    castable.sort(function(a, b) { return a.cmc - b.cmc; });
+
+    // Cast other spells using effective costs
+    var castable = handArr.filter(function(c) { return c.type !== 'land' && !c.isManaRock; });
+    castable.sort(function(a, b) { return getEffectiveCost(a) - getEffectiveCost(b); });
     var spent = 0;
     for (var si = 0; si < castable.length; si++) {
       var sp = castable[si];
-      if (spent + sp.cmc > mana) continue;
-      spent += sp.cmc;
+      var effectiveCost = getEffectiveCost(sp);
+      if (spent + effectiveCost > mana) continue;
+      spent += effectiveCost;
       handArr = handArr.filter(function(c) { return c.uid !== sp.uid; });
       if (["creature","artifact","enchantment","planeswalker"].indexOf(sp.type) !== -1) {
         board.push(sp);
-        actions.push({type:"cast", text:"Cast: " + sp.name + " (" + sp.type + ")"});
-        // Accurate token creation with doubler support
+        // Build cast label — show type detail including subtypes for creatures
+        var castLabel = sp.name + " (" + sp.type;
+        if (sp.type === 'creature' && sp.subtypes && sp.subtypes.length > 0) {
+          castLabel += " \u2014 " + sp.subtypes.slice(0,3).join(' ');
+        }
+        if (effectiveCost < (sp.cmc || 0)) castLabel += " [cost " + effectiveCost + "]";
+        castLabel += ")";
+        actions.push({type:"cast", text:"Cast: " + castLabel});
+
+        // Tokens
         var tc = sp.tokenCount || 0;
         if (tc > 0) {
           var actualTokens = tc * getTokenMultiplier();
           tokens += actualTokens;
-          actions.push({type:"token", text:"  \u2736 " + actualTokens + " token" + (actualTokens !== 1 ? "s" : "") + " created by " + sp.name});
+          actions.push({type:"token", text:"  \u2736 " + actualTokens + " token" + (actualTokens !== 1 ? "s" : "") + " from " + sp.name});
+        }
+
+        // If this creature produces mana, note it
+        if (sp.manaProducer) {
+          actions.push({type:"cast", text:"  + " + sp.name + " taps for " + (sp.manaAmount||1) + " mana each turn"});
+        }
+        // If this reduces costs, note it
+        if (sp.reductionAmount > 0) {
+          var reduceDesc = sp.reducesCommander ? "commander spells" :
+                           sp.reducesType ? sp.reducesType + " spells" :
+                           sp.reducesAll ? "all spells" : "spells";
+          actions.push({type:"cast", text:"  \u2193 " + sp.name + " reduces " + reduceDesc + " by " + sp.reductionAmount});
         }
       } else {
         gy.push(sp);
@@ -898,6 +1098,7 @@ function simulateGame() {
         if (cantrips.indexOf(sp.name) !== -1) { var d2 = libArr.shift(); if (d2) { handArr.push(d2); actions.push({type:"draw", text:"  Drew: " + d2.name}); } }
       }
     }
+
     var crCount = board.filter(function(c) { return c.type === 'creature'; }).length;
     var lc = board.filter(function(c) { return c.type === 'land'; }).length;
     logs.push({ turn: turn, actions: actions, mana: mana, handSize: handArr.length, creatureCount: crCount, tokenCount: tokens, landCount: lc, commanderOut: cmdOut, boardState: crCount + " creatures, " + tokens + " tokens, " + lc + " lands" });
